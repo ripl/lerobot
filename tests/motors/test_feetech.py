@@ -400,12 +400,12 @@ def test_set_half_turn_homings(mock_motors, dummy_motors):
     current_positions = {
         1: 1337,
         2: 42,
-        3: 3672,
+        3: 4665,
     }
     expected_homings = {
         1: -710,  # 1337 - 2047
         2: -2005,  # 42 - 2047
-        3: 1625,  # 3672 - 2047
+        3: -1478,  # 4665 -> wraps to -1478 so Present_Position becomes 2047
     }
     read_pos_stub = mock_motors.build_sync_read_stub(
         *STS_SMS_SERIES_CONTROL_TABLE["Present_Position"], current_positions
