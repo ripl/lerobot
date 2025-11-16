@@ -288,25 +288,8 @@ class FeetechMotorsBus(MotorsBus):
         half_turn_homings = {}
         for motor, pos in positions.items():
             model = self._get_motor_model(motor)
-            resolution = self.model_resolution_table[model]
-            max_res = resolution - 1
-            center = max_res // 2
-            offset = pos - center
-
-            sign_bit = self.model_encoding_table.get(model, {}).get("Homing_Offset")
-            if sign_bit is not None:
-                wrap_span = resolution
-                half_span = wrap_span // 2
-                offset = ((offset + half_span) % wrap_span) - half_span
-
-                max_magnitude = (1 << sign_bit) - 1
-                if abs(offset) > max_magnitude:
-                    raise ValueError(
-                        f"Homing offset {offset} for motor '{motor}' exceeds ±{max_magnitude}. "
-                        "Move the joint closer to the middle of its motion range and retry."
-                    )
-
-            half_turn_homings[motor] = offset
+            max_res = self.model_resolution_table[model] - 1
+            half_turn_homings[motor] = pos - int(max_res / 2)
 
         return half_turn_homings
 
