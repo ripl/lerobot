@@ -1,29 +1,44 @@
+import argparse
 import signal
 import sys
 import time
 from typing import Dict
 from collections import deque
 
+import ctypes
+import os
+from pathlib import Path
+
+
+def _ensure_qt_runtime_paths() -> None:
+    lib_dir = Path(sys.prefix) / "lib"
+    lib_str = str(lib_dir)
+    ld_path = os.environ.get("LD_LIBRARY_PATH")
+    if not ld_path:
+        os.environ["LD_LIBRARY_PATH"] = lib_str
+    elif lib_str not in ld_path.split(":"):
+        os.environ["LD_LIBRARY_PATH"] = f"{lib_str}:{ld_path}"
+
+
+def _preload_xcb_cursor() -> None:
+    cursor_lib = Path(sys.prefix) / "lib" / "libxcb-cursor.so.0"
+    if cursor_lib.exists():
+        ctypes.CDLL(str(cursor_lib))
+
+
+_ensure_qt_runtime_paths()
+_preload_xcb_cursor()
+
 import numpy as np
 from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QLabel
 from PyQt6.QtCore import QTimer
 import pyqtgraph as pg
 
-from lerobot.common.teleoperators.so101_leader import SO101LeaderConfig, SO101Leader
-from lerobot.common.robots.so101_follower import SO101FollowerConfig, SO101Follower
+from lerobot.teleoperators.so101_leader import SO101LeaderConfig, SO101Leader
+from lerobot.robots.so101_follower import SO101FollowerConfig, SO101Follower
 
-robot_config = SO101FollowerConfig(
-    port="/dev/ttyACM0",
-    id="follower10",
-)
-
-teleop_config = SO101LeaderConfig(
-    port="/dev/ttyACM1",
-    id="leader10",
-)
-
-robot = SO101Follower(robot_config)
-teleop_device = SO101Leader(teleop_config)
+robot: SO101Follower | None = None
+teleop_device: SO101Leader | None = None
 
 # Global data sharing between main loop and visualization
 class DataSharing:
@@ -207,13 +222,38 @@ def cleanup_and_exit(signum=None, frame=None):
     print("✓ Motors disabled")
     sys.exit(0)
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="SO101 Teleoperation Visualizer")
+    parser.add_argument("--follower-port", default="/dev/ttyACM0")
+    parser.add_argument("--follower-id", default="follower0")
+    parser.add_argument("--leader-port", default="/dev/ttyACM1")
+    parser.add_argument("--leader-id", default="leader0")
+    parser.add_argument("--update-freq", type=int, default=20)
+    return parser.parse_args()
+
 def main():
+    global robot, teleop_device
+    args = parse_args()
+    robot_config = SO101FollowerConfig(
+        port=args.follower_port,
+        id=args.follower_id,
+    )
+
+    teleop_config = SO101LeaderConfig(
+        port=args.leader_port,
+        id=args.leader_id,
+    )
+
+    robot = SO101Follower(robot_config)
+    teleop_device = SO101Leader(teleop_config)
     # Register signal handler for Ctrl+C
     signal.signal(signal.SIGINT, cleanup_and_exit)
 
     print("=== SO101 TELEOPERATION WITH VISUALIZATION ===")
     print("Connecting devices...")
     
+    # robot.connect(calibrate=False)
+    # teleop_device.connect(calibrate=False)
     robot.connect(calibrate=True)
     teleop_device.connect(calibrate=True)
     
@@ -224,7 +264,7 @@ def main():
     qt_app = QApplication([])
     
     # Create and show visualizer
-    visualizer = TeleopVisualizer(update_freq_hz=20)
+    visualizer = TeleopVisualizer(update_freq_hz=args.update_freq)
     visualizer.show()
     visualizer.raise_()
     visualizer.activateWindow()
