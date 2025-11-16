@@ -210,7 +210,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Replay a recorded joint-state episode.")
     parser.add_argument(
         "--episode",
-        default="/home/ripl/workspace/lerobot/datasets/nov14/episode_0000.h5",
+        default="/home/ripl/workspace/lerobot/datasets/nov16_50/episode_0032.h5",
     )
     parser.add_argument("--port", default="/dev/ttyACM0", help="Follower USB port (e.g. /dev/ttyACM0).")
     parser.add_argument("--follower-id", default="follower0", help="Follower calibration id.")

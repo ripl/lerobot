@@ -7,6 +7,7 @@ import termios
 import time
 import threading
 import tty
+from enum import Enum
 from pathlib import Path
 
 import h5py
@@ -83,10 +84,8 @@ class ControlWorker(threading.Thread):
         self.recording = False
         self.record_start_step = 0
         self.step = 0
-        self.start_time = time.perf_counter()
 
     def run(self) -> None:
-        self.start_time = time.perf_counter()
         while not self.stop_event.is_set():
             loop_start = time.perf_counter()
             command = self.teleop.get_action()
@@ -103,12 +102,11 @@ class ControlWorker(threading.Thread):
             if recording:
                 relative = current_step - record_start
                 if relative >= 0 and relative % self.record_stride == 0:
-                    timestamp = time.perf_counter() - self.start_time
                     command_snapshot = {key: float(value) for key, value in command.items()}
                     observation_snapshot = {
                         key: float(observation[key]) for key in self.joint_keys
                     }
-                    self.snapshot_queue.put((timestamp, command_snapshot, observation_snapshot))
+                    self.snapshot_queue.put((command_snapshot, observation_snapshot))
 
             elapsed = time.perf_counter() - loop_start
             remaining = self.control_interval - elapsed
@@ -123,6 +121,12 @@ class ControlWorker(threading.Thread):
     def disable_recording(self) -> None:
         with self.lock:
             self.recording = False
+
+
+class RecorderState(Enum):
+    IDLE = "idle"
+    RECORDING = "recording"
+    AWAITING_DECISION = "awaiting_decision"
 
 
 class JointRecorder:
@@ -143,6 +147,7 @@ class JointRecorder:
         self.teleop = teleop
         self.record_stride = record_stride
         self.record_frames = record_frames
+        self.record_dt = control_interval_s * record_stride
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.camera_width = stream_width
@@ -166,7 +171,6 @@ class JointRecorder:
 
         self.snapshot_queue: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
-        self.record_start_time: float | None = None
         self.control_worker = ControlWorker(
             robot=self.robot,
             teleop=self.teleop,
@@ -181,8 +185,7 @@ class JointRecorder:
         self.episode_index = 0
         self.record_buffer: dict[str, object] | None = None
         self.frames_collected = 0
-        self.recording_active = False
-        self.awaiting_decision = False
+        self.state = RecorderState.IDLE
 
     def run(self) -> None:
         print("Controls: press 's' to record, 'y'/'n' to keep or discard, 'q' to quit.")
@@ -198,10 +201,10 @@ class JointRecorder:
                         self._cancel_recording()
                         self.stop_event.set()
                         break
-                    if self.awaiting_decision and key in {"y", "n"}:
+                    if self.state is RecorderState.AWAITING_DECISION and key in {"y", "n"}:
                         self._complete_episode(save=(key == "y"))
                         continue
-                    if key == "s" and not self.recording_active and not self.awaiting_decision:
+                    if key == "s" and self.state is RecorderState.IDLE:
                         self._start_recording()
                         continue
                 self._collect_snapshots()
@@ -218,7 +221,6 @@ class JointRecorder:
 
     def _start_recording(self) -> None:
         self._drain_snapshot_queue()
-        self.record_start_time = None
         self.record_buffer = {
             "time": np.zeros(self.record_frames, dtype=np.float64),
             "joints": np.zeros((self.record_frames, len(self.joint_keys)), dtype=np.float32),
@@ -239,17 +241,17 @@ class JointRecorder:
             },
         }
         self.frames_collected = 0
-        self.recording_active = True
+        self.state = RecorderState.RECORDING
         self.control_worker.enable_recording()
         print("\nRecording episode...", flush=True)
 
     def _collect_snapshots(self) -> None:
-        if not self.recording_active or self.record_buffer is None:
+        if self.state is not RecorderState.RECORDING or self.record_buffer is None:
             return
 
         while True:
             try:
-                timestamp, command_snapshot, observation_snapshot = self.snapshot_queue.get_nowait()
+                command_snapshot, observation_snapshot = self.snapshot_queue.get_nowait()
             except Empty:
                 break
 
@@ -257,9 +259,7 @@ class JointRecorder:
             if idx >= self.record_frames:
                 continue
 
-            if self.record_start_time is None:
-                self.record_start_time = timestamp
-            self.record_buffer["time"][idx] = timestamp - self.record_start_time
+            self.record_buffer["time"][idx] = idx * self.record_dt
             self.record_buffer["commands"][idx] = np.array(
                 [command_snapshot[key] for key in self.command_keys],
                 dtype=np.float32,
@@ -272,10 +272,9 @@ class JointRecorder:
                 self.record_buffer["depth"][camera_id][idx] = depth_frames[camera_id]
             self.frames_collected += 1
 
-        if self.recording_active and self.frames_collected >= self.record_frames:
+        if self.state is RecorderState.RECORDING and self.frames_collected >= self.record_frames:
             self.control_worker.disable_recording()
-            self.recording_active = False
-            self.awaiting_decision = True
+            self.state = RecorderState.AWAITING_DECISION
             print("\nEpisode finished. Save episode? [y/n] ", end="", flush=True)
 
     def _complete_episode(self, *, save: bool) -> None:
@@ -283,27 +282,13 @@ class JointRecorder:
             return
 
         if save:
-            episode = {
-                "time": self.record_buffer["time"][: self.frames_collected],
-                "joints": self.record_buffer["joints"][: self.frames_collected],
-                "commands": self.record_buffer["commands"][: self.frames_collected],
-                "color": {
-                    camera_id: self.record_buffer["color"][camera_id][: self.frames_collected]
-                    for camera_id in self.camera_ids
-                },
-                "depth": {
-                    camera_id: self.record_buffer["depth"][camera_id][: self.frames_collected]
-                    for camera_id in self.camera_ids
-                },
-            }
-            self._save_episode(episode)
+            self._save_episode(self.frames_collected)
         else:
             print("\nEpisode discarded.")
 
         self.record_buffer = None
-        self.awaiting_decision = False
         self.frames_collected = 0
-        self.record_start_time = None
+        self.state = RecorderState.IDLE
         self._drain_snapshot_queue()
         print("Ready. Press 's' to start a new episode.")
 
@@ -316,13 +301,14 @@ class JointRecorder:
             depth_frames[camera.serial_number] = depth
         return color_frames, depth_frames
 
-    def _save_episode(self, episode: dict[str, object]) -> None:
+    def _save_episode(self, frame_count: int) -> None:
         episode_path = self.output_dir / f"episode_{self.episode_index:04d}.h5"
         self.episode_index += 1
+        buffer = self.record_buffer
         with h5py.File(episode_path, "w") as handle:
-            handle.create_dataset("time_s", data=episode["time"])
-            joint_dataset = handle.create_dataset("joint_position", data=episode["joints"])
-            command_dataset = handle.create_dataset("command_position", data=episode["commands"])
+            handle.create_dataset("time_s", data=buffer["time"][:frame_count])
+            joint_dataset = handle.create_dataset("joint_position", data=buffer["joints"][:frame_count])
+            command_dataset = handle.create_dataset("command_position", data=buffer["commands"][:frame_count])
             joint_dataset.attrs["joint_keys"] = np.array(
                 self.joint_keys, dtype=h5py.string_dtype("utf-8")
             )
@@ -332,8 +318,12 @@ class JointRecorder:
             color_group = handle.create_group("realsense_color_bgr_uint8")
             depth_group = handle.create_group("realsense_depth_z16_uint16")
             for camera_id in self.camera_ids:
-                color_dataset = color_group.create_dataset(camera_id, data=episode["color"][camera_id])
-                depth_dataset = depth_group.create_dataset(camera_id, data=episode["depth"][camera_id])
+                color_dataset = color_group.create_dataset(
+                    camera_id, data=buffer["color"][camera_id][:frame_count]
+                )
+                depth_dataset = depth_group.create_dataset(
+                    camera_id, data=buffer["depth"][camera_id][:frame_count]
+                )
                 camera = self.camera_lookup[camera_id]
                 color_dataset.attrs["height"] = self.camera_height
                 color_dataset.attrs["width"] = self.camera_width
@@ -353,11 +343,9 @@ class JointRecorder:
                 break
 
     def _cancel_recording(self) -> None:
-        self.recording_active = False
-        self.awaiting_decision = False
+        self.state = RecorderState.IDLE
         self.record_buffer = None
         self.frames_collected = 0
-        self.record_start_time = None
         self._drain_snapshot_queue()
 
 
@@ -372,7 +360,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-length", type=float, default=8.0, help="Episode length in seconds.")
     parser.add_argument(
         "--output-dir",
-        default=str(Path("/home/ripl/workspace/lerobot/datasets/nov14_50").resolve()),
+        default=str(Path("/home/ripl/workspace/lerobot/datasets/nov16_50").resolve()),
         help="Directory for recorded episodes.",
     )
     parser.add_argument("--follower-id", default="follower0", help="Follower calibration id.")
