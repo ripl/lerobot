@@ -55,16 +55,18 @@ def load_episode(path: Path) -> tuple[np.ndarray, np.ndarray, list[str], dict[st
 
 
 class LiveCaptureWorker(threading.Thread):
-    def __init__(self, serials: list[str], width: int, height: int, target_fps: float) -> None:
+    def __init__(self, serials: list[str], sizes: list[tuple[int, int]], target_fps: float) -> None:
         super().__init__(daemon=True)
         self.serials = serials
-        self.width = width
-        self.height = height
         self.target_interval = 1.0 / target_fps
         self.stop_event = threading.Event()
         self.frames: dict[str, list[np.ndarray]] = {serial: [] for serial in serials}
         self.timestamps: list[float] = []
-        self.cameras = [_RealSenseReader(serial, width, height, int(round(target_fps))) for serial in serials]
+        assert len(serials) == len(sizes)
+        self.cameras = [
+            _RealSenseReader(serial, int(size[0]), int(size[1]), int(round(target_fps)))
+            for serial, size in zip(serials, sizes)
+        ]
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -122,11 +124,11 @@ def save_two_by_two_video(
     recorded_times = times[:frame_count]
     indices = _interpolate_live_indices(recorded_times, live_times)
 
-    first_stream = recorded_images[serials[0]]
-    height = first_stream.shape[1]
-    width = first_stream.shape[2]
-    combined_width = width * 2
-    combined_height = height * 2
+    target_height = int(max(stream.shape[1] for stream in recorded_images.values()))
+    target_width = int(max(stream.shape[2] for stream in recorded_images.values()))
+    num_cams = len(serials)
+    combined_width = target_width * num_cams
+    combined_height = target_height * 2
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(
@@ -143,8 +145,18 @@ def save_two_by_two_video(
             live_sequence = live_frames[serial]
             recorded_frame = recorded_frames[idx]
             live_frame = live_sequence[indices[idx]]
-            top_row.append(recorded_frame)
-            bottom_row.append(live_frame)
+            recorded_resized = cv2.resize(
+                recorded_frame,
+                (target_width, target_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            live_resized = cv2.resize(
+                live_frame,
+                (target_width, target_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            top_row.append(recorded_resized)
+            bottom_row.append(live_resized)
         top_concat = np.hstack(top_row)
         bottom_concat = np.hstack(bottom_row)
         combined = np.vstack((top_concat, bottom_concat))
@@ -160,6 +172,7 @@ def replay_episode(
     control_fps: float,
     recorded_streams: dict[str, np.ndarray],
     realsense_serials: list[str],
+    sizes: list[tuple[int, int]],
     video_output: Path,
 ) -> None:
     times = time_s - time_s[0]
@@ -178,9 +191,7 @@ def replay_episode(
         flush=True,
     )
 
-    sample_stream = next(iter(recorded_streams.values()))
-    height, width = sample_stream.shape[1], sample_stream.shape[2]
-    live_worker = LiveCaptureWorker(realsense_serials, width, height, target_fps=30.0)
+    live_worker = LiveCaptureWorker(realsense_serials, sizes, target_fps=30.0)
     live_worker.start()
 
     start = time.perf_counter()
@@ -210,7 +221,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Replay a recorded joint-state episode.")
     parser.add_argument(
         "--episode",
-        default="/home/ripl/workspace/lerobot/datasets/nov16_50/episode_0032.h5",
+        default="/home/ripl/workspace/ProjectionPolicy/datasets/nov20/episode_0030.h5",
     )
     parser.add_argument("--port", default="/dev/ttyACM0", help="Follower USB port (e.g. /dev/ttyACM0).")
     parser.add_argument("--follower-id", default="follower0", help="Follower calibration id.")
@@ -218,12 +229,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--realsense-serial",
         action="append",
-        default=["817612070096", "817412070743"],
+        default=["817612070096", "817412070743", "213522251004"],
         help="RealSense serial numbers captured in the episode (order sets video layout).",
     )
     parser.add_argument(
+        "--size",
+        action="append",
+        default=[[1280, 720], [1280, 720], [640, 480]],
+        help="RealSense color/depth size. Provide multiple times for multi-camera capture.",
+    )
+    parser.add_argument(
         "--video-output",
-        default="/home/ripl/workspace/lerobot/outputs/replay_videos",
+        default="/home/ripl/workspace/ProjectionPolicy/outputs/replay_videos",
     )
     return parser.parse_args()
 
@@ -234,6 +251,7 @@ def main() -> None:
     time_s, commands, command_keys, recorded_images = load_episode(episode_path)
 
     ordered_images = {serial: recorded_images[serial] for serial in args.realsense_serial}
+    sizes = [(int(size[0]), int(size[1])) for size in args.size]
 
     config = SO101FollowerConfig(
         id=args.follower_id,
@@ -254,6 +272,7 @@ def main() -> None:
             control_fps=args.control_fps,
             recorded_streams=ordered_images,
             realsense_serials=args.realsense_serial,
+            sizes=sizes,
             video_output=video_output,
         )
     finally:

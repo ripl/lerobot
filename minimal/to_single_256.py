@@ -11,12 +11,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Merge RealSense episodes to a single HDF5 with 256x256 images.")
     parser.add_argument(
         "--input-dir",
-        default=str(Path("/home/ripl/workspace/ProjectionPolicy/datasets/nov16_50").resolve()),
+        default=str(Path("/home/ripl/workspace/ProjectionPolicy/datasets/nov20").resolve()),
         help="Directory containing episode_*.h5 files.",
     )
     parser.add_argument(
         "--output",
-        default=str(Path("/home/ripl/workspace/ProjectionPolicy/datasets/nov16_50_256.hdf5").resolve()),
+        default=str(Path("/home/ripl/workspace/ProjectionPolicy/datasets/nov20_256.hdf5").resolve()),
         help="Output HDF5 path.",
     )
     parser.add_argument("--size", type=int, default=256, help="Output image size (default: 256).")
@@ -58,9 +58,37 @@ def main() -> None:
             obs = demo.create_group("obs")
             for cam_id in tqdm(cam_ids, desc="cameras", leave=False):
                 with h5py.File(str(Path(epi_fp).resolve()), "r") as ep2:
-                    frames_bgr = ep2["realsense_color_bgr_uint8"][cam_id][:]
+                    color_ds = ep2["realsense_color_bgr_uint8"][cam_id]
+                    frames_bgr = color_ds[:]
+                    orig_h = int(color_ds.attrs["height"])
+                    orig_w = int(color_ds.attrs["width"])
+                    fx = float(color_ds.attrs["fx"])
+                    fy = float(color_ds.attrs["fy"])
+                    ppx = float(color_ds.attrs["ppx"])
+                    ppy = float(color_ds.attrs["ppy"])
+                    coeffs = np.asarray(color_ds.attrs["intrinsics_coeffs"], dtype=np.float32)
                 rgb = resize_rgb(frames_bgr, size)
-                obs.create_dataset(f"{cam_id}_image", data=rgb, compression=None)
+                ds = obs.create_dataset(f"{cam_id}_image", data=rgb, compression=None)
+                scale_x = float(size) / float(orig_w)
+                scale_y = float(size) / float(orig_h)
+                fx_resized = fx * scale_x
+                fy_resized = fy * scale_y
+                ppx_resized = ppx * scale_x
+                ppy_resized = ppy * scale_y
+                ds.attrs["orig_height"] = orig_h
+                ds.attrs["orig_width"] = orig_w
+                ds.attrs["orig_fx"] = fx
+                ds.attrs["orig_fy"] = fy
+                ds.attrs["orig_ppx"] = ppx
+                ds.attrs["orig_ppy"] = ppy
+                ds.attrs["orig_intrinsics_coeffs"] = coeffs
+                ds.attrs["height"] = int(size)
+                ds.attrs["width"] = int(size)
+                ds.attrs["fx"] = fx_resized
+                ds.attrs["fy"] = fy_resized
+                ds.attrs["ppx"] = ppx_resized
+                ds.attrs["ppy"] = ppy_resized
+                ds.attrs["intrinsics_coeffs"] = coeffs
 
 
 if __name__ == "__main__":

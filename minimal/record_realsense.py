@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import multiprocessing as mp
 import queue
 import select
 import sys
@@ -34,12 +35,24 @@ class _RealSenseCamera:
         self.profile: rs.pipeline_profile | None = None
         self.align = rs.align(rs.stream.color)
         self.depth_scale: float = 0.0
+        self.fx: float = 0.0
+        self.fy: float = 0.0
+        self.ppx: float = 0.0
+        self.ppy: float = 0.0
+        self.intrinsics_coeffs: np.ndarray | None = None
 
     def start(self) -> None:
         self.profile = self.pipeline.start(self.config)
         device = self.profile.get_device()
         depth_sensor = device.first_depth_sensor()
         self.depth_scale = depth_sensor.get_depth_scale()
+        color_stream = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
+        intr = color_stream.get_intrinsics()
+        self.fx = float(intr.fx)
+        self.fy = float(intr.fy)
+        self.ppx = float(intr.ppx)
+        self.ppy = float(intr.ppy)
+        self.intrinsics_coeffs = np.asarray(intr.coeffs, dtype=np.float32)
 
     def stop(self) -> None:
         self.pipeline.stop()
@@ -59,6 +72,51 @@ class _RealSenseCamera:
         if depth.shape[0] != self.height or depth.shape[1] != self.width:
             raise RuntimeError("RealSense depth frame has unexpected dimensions.")
         return color_bgr, depth.astype(np.uint16)
+
+
+def _camera_worker(
+    cmd_conn,
+    reply_conn,
+    serials: list[str],
+    sizes: list[tuple[int, int]],
+    fps: int,
+) -> None:
+    assert len(serials) == len(sizes)
+    cameras: dict[str, _RealSenseCamera] = {}
+    for serial, size in zip(serials, sizes):
+        width = int(size[0])
+        height = int(size[1])
+        cam = _RealSenseCamera(serial_number=serial, width=width, height=height, fps=int(fps))
+        cam.start()
+        cameras[serial] = cam
+
+    intrinsics: dict[str, dict[str, object]] = {}
+    for serial, cam in cameras.items():
+        intrinsics[serial] = {
+            "height": int(cam.height),
+            "width": int(cam.width),
+            "fx": float(cam.fx),
+            "fy": float(cam.fy),
+            "ppx": float(cam.ppx),
+            "ppy": float(cam.ppy),
+            "coeffs": cam.intrinsics_coeffs,
+            "depth_scale": float(cam.depth_scale),
+        }
+    reply_conn.send(intrinsics)
+
+    while True:
+        cmd = cmd_conn.recv()
+        if cmd == "close":
+            break
+        if cmd == "capture":
+            frames: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+            for serial, cam in cameras.items():
+                color, depth = cam.capture_frames()
+                frames[serial] = (color, depth)
+            reply_conn.send(frames)
+
+    for cam in cameras.values():
+        cam.stop()
 
 
 class ControlWorker(threading.Thread):
@@ -95,9 +153,9 @@ class ControlWorker(threading.Thread):
             self.step += 1
             current_step = self.step
 
-            with self.lock:
-                recording = self.recording
-                record_start = self.record_start_step
+            # with self.lock:
+            recording = self.recording
+            record_start = self.record_start_step
 
             if recording:
                 relative = current_step - record_start
@@ -114,13 +172,13 @@ class ControlWorker(threading.Thread):
                 time.sleep(remaining)
 
     def enable_recording(self) -> None:
-        with self.lock:
-            self.recording = True
-            self.record_start_step = self.step + 1
+        # with self.lock:
+        self.recording = True
+        self.record_start_step = self.step + 1
 
     def disable_recording(self) -> None:
-        with self.lock:
-            self.recording = False
+        # with self.lock:
+        self.recording = False
 
 
 class RecorderState(Enum):
@@ -139,8 +197,7 @@ class JointRecorder:
         record_frames: int,
         output_dir: Path,
         realsense_serials: list[str],
-        stream_width: int,
-        stream_height: int,
+        sizes: list,
         stream_fps: int,
     ) -> None:
         self.robot = robot
@@ -150,17 +207,30 @@ class JointRecorder:
         self.record_dt = control_interval_s * record_stride
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.camera_width = stream_width
-        self.camera_height = stream_height
         self.camera_fps = stream_fps
-        self.realsense_cameras = [
-            _RealSenseCamera(serial_number=serial, width=stream_width, height=stream_height, fps=stream_fps)
-            for serial in realsense_serials
-        ]
-        for camera in self.realsense_cameras:
-            camera.start()
-        self.camera_ids = [camera.serial_number for camera in self.realsense_cameras]
-        self.camera_lookup = {camera.serial_number: camera for camera in self.realsense_cameras}
+        assert len(realsense_serials) == len(sizes)
+        self.camera_ids = list(realsense_serials)
+
+        parent_cmd, child_cmd = mp.Pipe()
+        parent_reply, child_reply = mp.Pipe()
+        self._camera_cmd = parent_cmd
+        self._camera_reply = parent_reply
+        self._camera_proc = mp.Process(
+            target=_camera_worker,
+            args=(child_cmd, child_reply, realsense_serials, [(int(s[0]), int(s[1])) for s in sizes], int(stream_fps)),
+        )
+        self._camera_proc.start()
+
+        intrinsics: dict[str, dict[str, object]] = self._camera_reply.recv()
+        self.camera_shapes = {
+            serial: (int(info["height"]), int(info["width"])) for serial, info in intrinsics.items()
+        }
+        self.camera_fx = {serial: float(info["fx"]) for serial, info in intrinsics.items()}
+        self.camera_fy = {serial: float(info["fy"]) for serial, info in intrinsics.items()}
+        self.camera_ppx = {serial: float(info["ppx"]) for serial, info in intrinsics.items()}
+        self.camera_ppy = {serial: float(info["ppy"]) for serial, info in intrinsics.items()}
+        self.camera_coeffs = {serial: info["coeffs"] for serial, info in intrinsics.items()}
+        self.camera_depth_scale = {serial: float(info["depth_scale"]) for serial, info in intrinsics.items()}
 
         sample = self.robot.get_observation()
         self.joint_keys = [
@@ -216,8 +286,8 @@ class JointRecorder:
         self.stop_event.set()
         self.control_worker.disable_recording()
         self.control_worker.join()
-        for camera in self.realsense_cameras:
-            camera.stop()
+        self._camera_cmd.send("close")
+        self._camera_proc.join()
 
     def _start_recording(self) -> None:
         self._drain_snapshot_queue()
@@ -227,14 +297,23 @@ class JointRecorder:
             "commands": np.zeros((self.record_frames, len(self.command_keys)), dtype=np.float32),
             "color": {
                 camera_id: np.zeros(
-                    (self.record_frames, self.camera_height, self.camera_width, 3),
+                    (
+                        self.record_frames,
+                        self.camera_shapes[camera_id][0],
+                        self.camera_shapes[camera_id][1],
+                        3,
+                    ),
                     dtype=np.uint8,
                 )
                 for camera_id in self.camera_ids
             },
             "depth": {
                 camera_id: np.zeros(
-                    (self.record_frames, self.camera_height, self.camera_width),
+                    (
+                        self.record_frames,
+                        self.camera_shapes[camera_id][0],
+                        self.camera_shapes[camera_id][1],
+                    ),
                     dtype=np.uint16,
                 )
                 for camera_id in self.camera_ids
@@ -293,12 +372,14 @@ class JointRecorder:
         print("Ready. Press 's' to start a new episode.")
 
     def _capture_realsense_frames(self) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+        self._camera_cmd.send("capture")
+        frames: dict[str, tuple[np.ndarray, np.ndarray]] = self._camera_reply.recv()
         color_frames: dict[str, np.ndarray] = {}
         depth_frames: dict[str, np.ndarray] = {}
-        for camera in self.realsense_cameras:
-            color, depth = camera.capture_frames()
-            color_frames[camera.serial_number] = color
-            depth_frames[camera.serial_number] = depth
+        for camera_id in self.camera_ids:
+            color, depth = frames[camera_id]
+            color_frames[camera_id] = color
+            depth_frames[camera_id] = depth
         return color_frames, depth_frames
 
     def _save_episode(self, frame_count: int) -> None:
@@ -324,15 +405,21 @@ class JointRecorder:
                 depth_dataset = depth_group.create_dataset(
                     camera_id, data=buffer["depth"][camera_id][:frame_count]
                 )
-                camera = self.camera_lookup[camera_id]
-                color_dataset.attrs["height"] = self.camera_height
-                color_dataset.attrs["width"] = self.camera_width
+                color_dataset.attrs["height"] = self.camera_shapes[camera_id][0]
+                color_dataset.attrs["width"] = self.camera_shapes[camera_id][1]
                 color_dataset.attrs["channels"] = 3
                 color_dataset.attrs["fps"] = self.camera_fps
-                depth_dataset.attrs["height"] = self.camera_height
-                depth_dataset.attrs["width"] = self.camera_width
+                color_dataset.attrs["fx"] = self.camera_fx[camera_id]
+                color_dataset.attrs["fy"] = self.camera_fy[camera_id]
+                color_dataset.attrs["ppx"] = self.camera_ppx[camera_id]
+                color_dataset.attrs["ppy"] = self.camera_ppy[camera_id]
+                coeffs = self.camera_coeffs[camera_id]
+                if coeffs is not None:
+                    color_dataset.attrs["intrinsics_coeffs"] = coeffs
+                depth_dataset.attrs["height"] = self.camera_shapes[camera_id][0]
+                depth_dataset.attrs["width"] = self.camera_shapes[camera_id][1]
                 depth_dataset.attrs["units"] = "meters"
-                depth_dataset.attrs["scale"] = camera.depth_scale
+                depth_dataset.attrs["scale"] = self.camera_depth_scale[camera_id]
         print(f"\nSaved episode to {episode_path}", flush=True)
 
     def _drain_snapshot_queue(self) -> None:
@@ -355,12 +442,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-fps", type=float, default=210.0, help="Control loop frequency (Hz).")
     parser.add_argument("--record-fps", type=float, default=10.0, help="Recording frequency (Hz).")
     parser.add_argument("--stream-fps", type=float, default=30.0, help="RealSense streaming frequency (Hz).")
-    parser.add_argument("--stream-width", type=int, default=1280, help="RealSense color/depth width.")
-    parser.add_argument("--stream-height", type=int, default=720, help="RealSense color/depth height.")
-    parser.add_argument("--episode-length", type=float, default=8.0, help="Episode length in seconds.")
+    parser.add_argument("--episode-length", type=float, default=10.0, help="Episode length in seconds.")
     parser.add_argument(
         "--output-dir",
-        default=str(Path("/home/ripl/workspace/lerobot/datasets/nov16_50").resolve()),
+        default=str(Path("/home/ripl/workspace/ProjectionPolicy/datasets/nov20").resolve()),
         help="Directory for recorded episodes.",
     )
     parser.add_argument("--follower-id", default="follower0", help="Follower calibration id.")
@@ -369,8 +454,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--realsense-serial",
         action="append",
-        default=["817612070096", "817412070743"],
+        # D455 (213522251004) has a larger baseline / FOV; the others are D435 units.
+        default=["817612070096", "817412070743", "213522251004"],
         help="RealSense serial number. Provide multiple times for multi-camera capture.",
+    )
+    parser.add_argument("--size",
+        action="append",
+        default=[[1280, 720], [1280, 720], [640, 480]],
+        help="RealSense color/depth size. Provide multiple times for multi-camera capture.",
     )
     return parser.parse_args()
 
@@ -381,8 +472,7 @@ def main() -> None:
     control_rate = int(round(args.control_fps))
     record_rate = int(round(args.record_fps))
     stream_rate = int(round(args.stream_fps))
-    stream_width = int(args.stream_width)
-    stream_height = int(args.stream_height)
+    sizes = [(int(size[0]), int(size[1])) for size in args.size]
 
     if not args.realsense_serial:
         raise ValueError("At least one --realsense-serial must be provided.")
@@ -417,8 +507,7 @@ def main() -> None:
             record_frames=record_frames,
             output_dir=output_dir,
             realsense_serials=args.realsense_serial,
-            stream_width=stream_width,
-            stream_height=stream_height,
+            sizes=sizes,
             stream_fps=stream_rate,
         )
         recorder.run()
